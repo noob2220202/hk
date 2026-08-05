@@ -16,6 +16,8 @@
 
 - 대상은 **Cloudflare** 뒤에 있으며, 비브라우저/봇 요청은 다수 `403`으로 차단됩니다. 따라서 `403`은 "파일 없음"이 아니라 "WAF 차단"일 수 있어, 파일 부재를 단정할 수 없습니다.
 - 본 점검 실행 환경은 **송신 TLS를 프록시가 종단**하므로, 실제 서버 인증서/암호군(cipher suite)/TLS 버전을 이 환경에서 신뢰성 있게 판별할 수 없습니다. → **TLS 구성은 외부 도구(SSL Labs 등)로 별도 확인 필요.**
+- **WAF는 시그니처 기반**으로 확인됨: 전형적 SQLi(`' OR '1'='1`)·XSS(`<script>`, `alert(`)는 `403` 차단하나, **문자열 탈출/이벤트핸들러 프리미티브는 통과**(F-00 참조). 따라서 블랙박스에서 "차단됨=안전"이 아니며, **앱 계층 확정은 오리진(Cloudflare 우회) 직접 테스트**가 필요합니다. WAF는 보완책일 뿐 근본 해결책이 아님.
+- 능동 탐침은 **엔드포인트당 단발성**으로 최소화했으며, 브루트포스·쿠키 탈취·자금 관련 동작·작동하는 XSS 실행 페이로드는 수행하지 않았습니다.
 
 ---
 
@@ -34,6 +36,46 @@
 ## 2. 발견 사항 (Findings)
 
 심각도는 CVSS 정성 기준(블랙박스 관측 기반 추정치)입니다. 확정은 화이트박스에서.
+
+> **[2차 능동 점검 업데이트]** 아래 **F-00 / F-11 / F-12 / F-13** 은 소량의 능동 탐침으로 **실제 확정**된 항목입니다(비파괴). 특히 **F-00(반사형 XSS)** 은 F-01(HttpOnly 없는 세션쿠키)과 결합해 **계정 탈취(ATO)** 로 이어지는 최우선 위험입니다.
+
+### 🟥 F-00 (Critical, 확정) 반사형 XSS — 슬롯 데모 `game` 파라미터
+`/casino/slot/mg_demo_free.php`(및 `mg_demo.php`)는 `game` 값을 **인라인 `<script>` 내부 JS 문자열에 인코딩 없이 그대로 삽입**합니다.
+
+```
+요청: /casino/slot/mg_demo_free.php?game=abc'def"gh<x>
+응답(inline JS): 
+    data: {api: 'startSlotDemo', site: 1, gameid: 'abc'def"gh<x>'},
+```
+
+- 단일따옴표 `'` 가 그대로 반영되어 **JS 문자열 리터럴을 탈출** → 임의 스크립트 주입 가능.
+- **WAF는 시그니처 기반**: `<script>`·`alert(` 는 403 차단하나, **문자열 탈출 프리미티브 `'};` 와 `onerror=` 는 통과·원본 반영**(아래 표). 시그니처 우회는 보편적이므로 **실무상 익스플로잇 가능**으로 평가.
+
+| 페이로드(`game=`) | HTTP | 반영 |
+|---|---|---|
+| `a'};//BREAKOK` | 200 | `gameid: 'a'};//BREAKOK'},` (원본) |
+| `onerror=x` | 200 | 원본 반영 |
+| `<script>x</script>` | 403 | WAF 차단 |
+| `'-alert(1)-'` | 403 | WAF 차단 |
+
+- **연쇄(Chain):** F-00(XSS) + F-01(HttpOnly 미설정) → 피해자에게 조작된 데모 링크 전달 시 `document.cookie`(PHPSESSID) 탈취 → **세션 하이재킹/계정 탈취**. 카지노 특성상 자금 직결.
+- **근본 원인/해결:** WAF에 의존하지 말고 **문맥 기반 출력 인코딩**(JS 문자열 컨텍스트 → JSON 인코딩/`json_encode`), 허용목록 검증(`game`는 `^[A-Za-z0-9_]+$` 정도만 허용).
+
+### 🟠 F-11 (Medium, 확정) 미인증 정보 노출 — 랭킹/업스트림 오류
+- `GET /ajax/money_rank.php` — **비로그인 상태에서** 사용자 활동 노출: 마스킹 아이디(`hs***987`), 금액(`700,000 원`), 시각(`08/04 20:01`). 부분 마스킹이나 활동 패턴·부분 식별자 유출.
+- `POST /ajax/callapi_free.php` — 상위 게임 아그리게이터 API의 **원본 오류를 그대로 프록시**:
+  ```
+  <returndata>404{"error":{"code":"ContentNotFoundForPlayer",...}}</returndata>
+  <returndata>400{"error":{"code":"GameDoesNotExist","message-zh-CHS":"游戏对代理人不存在"}}</returndata>
+  ```
+  → 백엔드 연동 구조/에이전트 개념/상위 상태코드 노출(정보수집에 활용됨).
+
+### 🟠 F-12 (Medium/High, 화이트박스) 디스패처·SSRF 표면 — `callapi_free.php`
+- `callapi_free.php` 는 **미인증**으로 클라이언트 파라미터(`api`, `site`, `gameid`)를 받아 **서버측에서 상위 API를 호출**하는 디스패처. `api` 값으로 동작이 라우팅됨.
+- 위험: **SSRF/파라미터 변조/기능 남용**. `site` 로 대상/에이전트 선택 가능성. 이름상 인증 버전 **`callapi.php`**(실 자금 연동)가 존재할 개연성 → 화이트박스 최우선.
+
+### 🟡 F-13 (Info, 확정) 프로덕션 디버그 코드
+- 데모 페이지 인라인 스크립트에 `console.log("Fuck");` 등 **디버그/비속어 코드 잔존**. 정보성이나 코드 위생/유출 관점 정리 필요.
 
 ### 🔴 F-01 (High) 세션 쿠키 보안 플래그 누락
 관측된 `Set-Cookie`:
@@ -137,7 +179,9 @@ HTML/JS에서 식별된 서버 엔드포인트 — 화이트박스에서 입력�
 |---|---|---|
 | `/post/login_ok.php` | 로그인 처리(POST) | SQLi, 레이트리밋, 세션재생성, CSRF, 계정잠금 |
 | `/post/community_binding.php` | 커뮤니티/바인딩(POST) | 인증확인, IDOR, 입력검증 |
-| `/ajax/money_rank.php` | 금액 랭킹(AJAX) | 정보노출, 권한, SQLi |
+| `/ajax/money_rank.php` | 금액 랭킹(AJAX) | **미인증 정보노출(F-11 확정)**, 권한, SQLi |
+| `/ajax/callapi_free.php` | 게임 API 디스패처(미인증) | **SSRF/파라미터변조(F-12)**, `api`/`site`/`gameid` 검증, 오류프록시 |
+| `/ajax/callapi.php` (추정) | 인증 게임/자금 API 디스패처 | 인증·인가, 금액변조, SSRF, 서명검증 |
 | `/index.php` | 메인 | 파라미터 반영/XSS |
 | `/casino-ab.php` `/casino-ag.php` `/casino-eg.php` `/casino-mg.php` `/casino-pr.php` | 카지노 게임 연동 | 프로바이더 콜백 검증, SSRF, 서명검증 |
 | `/sports-bti.php` `/sports-pinnacle.php` `/sports-sbo.php` | 스포츠북 연동 | 콜백/토큰 검증, 금액 변조 |
@@ -174,6 +218,7 @@ HTML/JS에서 식별된 서버 엔드포인트 — 화이트박스에서 입력�
   - `Content-Security-Policy`(우선 Report-Only로 시작 → 인라인 스크립트/eval 정리 후 강화)
   - `Permissions-Policy`(불필요 기능 차단)
 - **쿠키 플래그**: PHP `session.cookie_httponly=1`, `cookie_secure=1`, `cookie_samesite=Lax|Strict`; `UUID`에도 동일 적용. 쿠키 `domain`을 필요한 최소 범위로.
+- **F-00(반사형 XSS) 긴급 완화**: `game`/`gameid` 입력을 서버측에서 허용목록 검증(`^[A-Za-z0-9_]+$`) + 출력 시 `json_encode`로 JS 문자열 인코딩. WAF 규칙 강화는 임시책일 뿐.
 - **로그인 캡차 재활성화**(주석 해제) + **레이트리밋/계정 잠금**(Cloudflare Rate Limiting Rules).
 - **P3P 헤더 제거**, 레거시 캐시 헤더 정리.
 - **외부 스크립트 SRI 적용** 또는 자가호스팅, **jQuery 등 라이브러리 최신화**.
@@ -192,6 +237,11 @@ curl -sS -D - -o /dev/null -A "$UA" http://www.dw-04.com/
 # 로그인 오류 응답(사용자 열거 미유발 확인)
 curl -sS -A "$UA" --data "login_id=INVALID&login_pw=INVALID" \
   https://www.dw-04.com/post/login_ok.php
+# F-00 반사형 XSS 반영 확인(비실행 마커) — gameid 문자열이 원본 반영됨
+curl -sS -A "$UA" --get --data-urlencode "game=abc'def\"gh<x>" \
+  https://www.dw-04.com/casino/slot/mg_demo_free.php | grep "gameid:"
+# F-11 미인증 랭킹 노출
+curl -sS -A "$UA" https://www.dw-04.com/ajax/money_rank.php | grep uid
 ```
 
 ---
