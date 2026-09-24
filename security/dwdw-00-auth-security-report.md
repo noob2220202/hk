@@ -2,7 +2,7 @@
 
 - **대상(Target):** `https://www.dwdw-00.com/` (대왕 카지노)
 - **점검 유형:** 인증(Authenticated) 블랙박스 — 로그인 후 공격적 테스트
-- **테스트 계정:** `rnalswo` / `rnalswo!`
+- **테스트 계정:** `rnalswo` / `[REDACTED]`
 - **권한(Authorization):** 사이트 소유자/운영자 본인이 점검을 요청·승인 (self-owned)
 - **원칙:** 비파괴(non-destructive) — 실제 자금 변조/이체 미수행, 데이터 삭제 없음
 - **작성일:** 2026-09-24
@@ -51,11 +51,11 @@ POST /post/community_binding.php
 (인증된 세션, 별도 파라미터 불필요)
 
 응답:
-{"url" : "http://www.flower-01.com/bbs/login.php?uid=rnalswo&pwd=0041&ch=23", "pwd" : "0041"}
+{"url" : "http://www.flower-01.com/bbs/login.php?uid=rnalswo&pwd=[REDACTED]&ch=23", "pwd" : "[REDACTED]"}
 ```
 
 **위험 분석:**
-- **자격증명 URL 포함:** 사용자 ID(`uid=rnalswo`)와 비밀번호(`pwd=0041`)가 **GET 파라미터에 평문**으로 포함. URL은 브라우저 히스토리, 서버 액세스 로그, Referer 헤더, 프록시 로그 등에 기록됨.
+- **자격증명 URL 포함:** 사용자 ID와 비밀번호가 **GET 파라미터에 평문**으로 포함. URL은 브라우저 히스토리, 서버 액세스 로그, Referer 헤더, 프록시 로그 등에 기록됨.
 - **HTTP(비암호화) 전송:** 대상 URL이 `http://` (HTTPS 아님) — 네트워크 도청으로 자격증명 탈취 가능.
 - **CSRF 토큰 없음:** POST 요청이지만 토큰 검증 없이 세션 쿠키만으로 동작 → XSS(F-00)와 결합하면 공격자가 피해자의 커뮤니티 자격증명을 원격 탈취 가능.
 - **GET 요청으로도 동작:** `GET /post/community_binding.php`로도 동일 응답 반환 → CSRF 공격 시 더 쉬움.
@@ -380,7 +380,7 @@ UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126 Safari/537.36"
 # F-NEW-01: 커뮤니티 자격증명 노출 (인증 필요)
 # 먼저 로그인 후 PHPSESSID 쿠키 획득
 curl -sS -c cookies.txt -A "$UA" \
-  --data "login_id=rnalswo&login_pw=rnalswo!" \
+  --data "login_id=<USER>&login_pw=<PASS>" \
   https://www.dwdw-00.com/post/login_ok.php
 
 # 자격증명 평문 반환 확인
@@ -395,7 +395,7 @@ curl -sS -b cookies.txt -A "$UA" \
 curl -sS -D - -o /dev/null -c cookies2.txt -A "$UA" https://www.dwdw-00.com/
 grep PHPSESSID cookies2.txt
 curl -sS -b cookies2.txt -A "$UA" \
-  --data "login_id=rnalswo&login_pw=rnalswo!" \
+  --data "login_id=<USER>&login_pw=<PASS>" \
   https://www.dwdw-00.com/post/login_ok.php
 # PHPSESSID가 변경되지 않으면 세션 고정 취약
 
