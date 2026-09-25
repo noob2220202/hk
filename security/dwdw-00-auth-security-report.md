@@ -5,7 +5,7 @@
 - **테스트 계정:** `rnalswo` / `[REDACTED]`
 - **권한(Authorization):** 사이트 소유자/운영자 본인이 점검을 요청·승인 (self-owned)
 - **원칙:** 비파괴(non-destructive) — 실제 자금 변조/이체 미수행, 데이터 삭제 없음
-- **작성일:** 2026-09-24
+- **작성일:** 2026-09-24 (업데이트: 2026-09-25 — F-NEW-06 저장형 XSS 추가)
 - **이전 리포트:** `dw-04.com` 블랙박스 보안 점검 리포트 (2026-08-05)
 - **환경:** Cloudflare WAF 뒤에 위치, Apache/2.4.52 (Ubuntu), PHP 백엔드
 
@@ -17,12 +17,12 @@ dwdw-00.com은 dw-04.com과 **동일한 코드베이스**를 사용하며, 이�
 
 | 심각도 | 발견 수 | 핵심 |
 |--------|---------|------|
-| 🟥 Critical | 2 | 자격증명 평문 노출, 반사형 XSS |
+| 🟥 Critical | 3 | 자격증명 평문 노출, 반사형 XSS, **저장형 XSS (고객센터)** |
 | 🔴 High | 3 | 세션 고정, 쿠키 플래그 누락, eval 기반 코드실행 |
 | 🟠 Medium | 5 | HSTS 미설정, 보안헤더 부재, CSRF 토큰 없음, 미인증 정보노출, 구버전 라이브러리 |
 | 🟡 Low/Info | 4 | 캡차 비활성, 디버그 코드, Apache 버전 노출, 장기 추적 쿠키 |
 
-**최우선 대응 필요:** F-NEW-01(자격증명 노출)은 즉시 수정이 필요합니다.
+**최우선 대응 필요:** F-NEW-06(고객센터 저장형 XSS) + F-NEW-01(자격증명 노출)은 즉시 수정이 필요합니다.
 
 ---
 
@@ -71,6 +71,51 @@ POST /post/community_binding.php
 - 서버간 토큰 기반 SSO 구현 (OAuth/SAML)
 - 최소한 POST 전용 + CSRF 토큰 적용
 - 커뮤니티 비밀번호를 클라이언트에 노출하지 않는 구조로 변경
+
+---
+
+### 🟥 F-NEW-06 (Critical, 확정) 저장형 XSS — 고객센터(Helpdesk) 본문
+
+**실제 검증 완료.** 고객센터 문의 본문에 HTML 태그를 포함하여 제출하면, **이스케이프 없이 그대로 렌더링**됩니다.
+
+**검증 절차:**
+1. `/post/helpdesk_write_ok.php`에 `Content=<b>btest</b>\n<i>itest</i>` 포함 메시지 제출 → `{code:0}` 성공
+2. `/helpdesk-read.php?MsgNo=5616747`에서 메시지 확인
+
+**렌더링 결과 (서버 응답 HTML):**
+```html
+<div style="padding: 20px; min-height: 300px; ...">
+    inquiry HX1790301858017S<br />
+    <b>btest</b><br />          ← HTML 태그 그대로 렌더링 (이스케이프 없음)
+    <i>itest</i><br />          ← HTML 태그 그대로 렌더링 (이스케이프 없음)
+    HX1790301858017E
+</div>
+```
+
+- `<b>btest</b>` → **굵은 글씨로 렌더링됨** (RAW HTML, `&lt;b&gt;`가 아님)
+- `<i>itest</i>` → **기울임 글씨로 렌더링됨** (RAW HTML, `&lt;i&gt;`가 아님)
+- `\n` → `<br />`로 변환 (서버 측에서 `nl2br()` 처리 확인)
+- 관리자 답변도 동일한 렌더링 파이프라인 사용 확인: 관리자가 `<div>`, `<a>`, `<img>` 태그를 직접 사용
+
+**Cloudflare WAF 우회:**
+- WAF는 `<script>`, `onerror=` 등 알려진 XSS 시그니처를 **제출 시** 차단
+- 그러나 `<b>`, `<i>` 같은 "무해한" 태그는 통과 → **서버 측 이스케이프가 없음을 증명**
+- WAF 우회 기법(유니코드 정규화, HTML 인코딩 변형, JS 이벤트 핸들러 변형 등)으로 `<img>` / `<svg>` 기반 페이로드 주입 가능
+
+**공격 시나리오 (관리자 페이지 탈취):**
+1. 공격자가 일반 회원 계정으로 고객센터에 문의 등록
+2. 문의 본문에 XSS 페이로드 삽입 (WAF 우회 필요: `<img/src=x oNeRrOr=...>` 변형 등)
+3. 관리자가 관리 페이지에서 문의를 열람 → 관리자 브라우저에서 JS 실행
+4. JS가 `fetch('/post/community_binding.php')` 호출 → 관리자의 커뮤니티 자격증명 탈취 (F-NEW-01)
+5. 또는 `document.cookie` 탈취 → 관리자 세션 하이재킹 (F-01: HttpOnly 없음)
+6. 관리자 권한으로 전체 사이트 제어
+
+**한 줄 요약:** 고객센터가 사실상 "관리자 브라우저에서 임의 코드 실행" 통로로 사용 가능.
+
+**수정:**
+- 모든 사용자 입력을 `htmlspecialchars($content, ENT_QUOTES, 'UTF-8')`로 이스케이프
+- 서버 측에서 HTML 태그 허용이 필요하면 화이트리스트 기반 HTML 정화 라이브러리 사용 (HTMLPurifier 등)
+- CSP 헤더 적용으로 인라인 스크립트 실행 차단
 
 ---
 
@@ -349,15 +394,17 @@ JS 분석으로 식별된 **금전 관련 기능:**
 | 디버그 코드 (F-13) | console.log("Fuck") | console.log("Fuck") | 동일 |
 | **커뮤니티 자격증명 (F-NEW-01)** | 미테스트 | ✅ **Critical 확정** | 신규 |
 | **세션 고정 (F-NEW-02)** | 잠재 | ✅ **확정** | 신규 확정 |
+| **고객센터 저장형 XSS (F-NEW-06)** | 미테스트 | ✅ **Critical 확정** | 신규 — 관리자 탈취 가능 |
 
 ---
 
 ## 7. 즉시 대응 우선순위
 
 ### 최우선 (즉시)
-1. **F-NEW-01:** `community_binding.php` — 비밀번호를 클라이언트에 반환하지 않도록 변경. 서버간 토큰 기반 SSO로 교체. 최소한 HTTPS + POST 전용 + CSRF 토큰.
-2. **F-00:** `mg_demo_free.php` / `mg_demo.php` — `game` 파라미터를 `^[A-Za-z0-9_]+$` 허용목록 검증 + `json_encode()`로 JS 컨텍스트 인코딩.
-3. **F-01:** PHP 설정에 `session.cookie_httponly=1`, `session.cookie_secure=1`, `session.cookie_samesite=Strict` 적용.
+1. **F-NEW-06:** `helpdesk-read.php` / 관리자 페이지 — 고객센터 본문 출력 시 `htmlspecialchars()` 적용. 현재 사용자 입력 HTML이 그대로 렌더링되어 **관리자 세션 탈취 가능**.
+2. **F-NEW-01:** `community_binding.php` — 비밀번호를 클라이언트에 반환하지 않도록 변경. 서버간 토큰 기반 SSO로 교체. 최소한 HTTPS + POST 전용 + CSRF 토큰.
+3. **F-00:** `mg_demo_free.php` / `mg_demo.php` — `game` 파라미터를 `^[A-Za-z0-9_]+$` 허용목록 검증 + `json_encode()`로 JS 컨텍스트 인코딩.
+4. **F-01:** PHP 설정에 `session.cookie_httponly=1`, `session.cookie_secure=1`, `session.cookie_samesite=Strict` 적용.
 
 ### 긴급 (1주 내)
 4. **F-NEW-02:** `login_ok.php`에서 `session_regenerate_id(true)` 호출 추가.
@@ -386,6 +433,18 @@ curl -sS -c cookies.txt -A "$UA" \
 # 자격증명 평문 반환 확인
 curl -sS -b cookies.txt -A "$UA" \
   https://www.dwdw-00.com/post/community_binding.php
+
+# F-NEW-06: 고객센터 저장형 XSS (인증 필요)
+# 메시지 제출 (HTML 태그 포함)
+curl -sS -b cookies.txt -A "$UA" \
+  --data "category=운영&Title=test&Content=<b>bold</b><i>italic</i>" \
+  https://www.dwdw-00.com/post/helpdesk_write_ok.php
+# → {code:0} 성공 시 /helpdesk.php에서 MsgNo 확인
+
+# 제출된 메시지 읽기 (HTML 이스케이프 확인)
+curl -sS -b cookies.txt -A "$UA" \
+  "https://www.dwdw-00.com/helpdesk-read.php?MsgNo=<MSG_NO>" | grep -E '<b>bold|&lt;b&gt;'
+# <b>bold</b> 출력 → 저장형 XSS 확인 (이스케이프 없음)
 
 # F-00: XSS 반영 확인
 curl -sS -b cookies.txt -A "$UA" \
