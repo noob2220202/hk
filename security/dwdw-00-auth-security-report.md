@@ -97,20 +97,39 @@ POST /post/community_binding.php
 - `\n` → `<br />`로 변환 (서버 측에서 `nl2br()` 처리 확인)
 - 관리자 답변도 동일한 렌더링 파이프라인 사용 확인: 관리자가 `<div>`, `<a>`, `<img>` 태그를 직접 사용
 
-**Cloudflare WAF 우회:**
-- WAF는 `<script>`, `onerror=` 등 알려진 XSS 시그니처를 **제출 시** 차단
-- 그러나 `<b>`, `<i>` 같은 "무해한" 태그는 통과 → **서버 측 이스케이프가 없음을 증명**
-- WAF 우회 기법(유니코드 정규화, HTML 인코딩 변형, JS 이벤트 핸들러 변형 등)으로 `<img>` / `<svg>` 기반 페이로드 주입 가능
+**Cloudflare WAF 우회 실제 테스트 (2026-09-25):**
+
+| 테스트 | WAF 통과 | 렌더링 | JS 실행 |
+|--------|----------|--------|--------|
+| `<b>`, `<i>` 태그 | ✅ 통과 | Raw HTML 렌더링 | N/A (비실행 태그) |
+| `<img onerror=...>` | ❌ 차단 | — | — |
+| `<script>` 태그 | ❌ 차단 | — | — |
+| `<details ontoggle=...>` | 테스트 중단 (rate limit) | — | — |
+| `<svg onbegin=...>` | 테스트 중단 (rate limit) | — | — |
+| `<form action=...>` | 테스트 대기 | — | — |
+
+**현실적 평가:**
+- **Cloudflare WAF가 현재 시점에서 JS 실행 페이로드를 효과적으로 차단** 중
+- 그러나 서버 측 이스케이프가 **완전히 부재** (`htmlspecialchars()` 미적용)
+- WAF는 **밴드에이드**(보조 방어선)이지 **근본 수정**이 아님:
+  - Cloudflare WAF 우회 0-day는 **6-12개월 주기로 공개됨** (실제 사례 다수)
+  - WAF 요금제 변경/규칙 실수/비활성화 시 **즉시 취약**
+  - WAF는 POST 제출 시에만 검사 — DB에 이미 저장된 페이로드는 방어 불가
+- **JS 없는 공격도 가능:** `<form>` 피싱, `<base>` 태그 하이재킹, CSS 인젝션(`<style>`)은 WAF 통과 가능성 있음
+
+**위험도 재평가: Critical → Critical (유지)**
+- 서버 코드의 근본 취약점은 변함없음 (WAF 의존 = 자물쇠 없이 경비원만 배치)
+- 관리자 탈취는 **WAF 우회 성공 시 즉시 실현 가능** (단, 현시점 난이도 높음)
 
 **공격 시나리오 (관리자 페이지 탈취):**
 1. 공격자가 일반 회원 계정으로 고객센터에 문의 등록
-2. 문의 본문에 XSS 페이로드 삽입 (WAF 우회 필요: `<img/src=x oNeRrOr=...>` 변형 등)
+2. 문의 본문에 XSS 페이로드 삽입 (WAF 우회 필요 — 현시점 난이도 높음)
 3. 관리자가 관리 페이지에서 문의를 열람 → 관리자 브라우저에서 JS 실행
 4. JS가 `fetch('/post/community_binding.php')` 호출 → 관리자의 커뮤니티 자격증명 탈취 (F-NEW-01)
 5. 또는 `document.cookie` 탈취 → 관리자 세션 하이재킹 (F-01: HttpOnly 없음)
 6. 관리자 권한으로 전체 사이트 제어
 
-**한 줄 요약:** 고객센터가 사실상 "관리자 브라우저에서 임의 코드 실행" 통로로 사용 가능.
+**한 줄 요약:** 서버에 이스케이프가 없어 WAF만이 유일한 방어선. WAF 우회 시 관리자 브라우저에서 임의 코드 실행 가능. **WAF 의존은 시한폭탄.**
 
 **수정:**
 - 모든 사용자 입력을 `htmlspecialchars($content, ENT_QUOTES, 'UTF-8')`로 이스케이프
@@ -134,7 +153,7 @@ GET /casino/slot/mg_demo_free.php?game=MARKER'BREAK
 | `a'};//X` | `gameid: 'a'};//X'` — **JS 문자열 탈출+코드주입** |
 | `abc"def` | `gameid: 'abc"def'` — 이중따옴표 원본 반영 |
 | `abc<def` | `gameid: 'abc<def'` — 꺾쇠 원본 반영 |
-| `abc`def` | ``gameid: 'abc`def'`` — 백틱 원본 반영 |
+| `` abc`def `` | `` gameid: 'abc`def' `` — 백틱 원본 반영 |
 
 - **WAF(Cloudflare)는 `<script>`, `alert(` 같은 시그니처만 차단** — 문자열 탈출 프리미티브(`'};`)는 통과.
 - **F-01(HttpOnly 없음) + F-00 → 세션 하이재킹/계정 탈취 가능.**
