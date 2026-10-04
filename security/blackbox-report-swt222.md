@@ -4,8 +4,12 @@
 - **점검 유형:** 블랙박스(외부 관찰) — 소스코드 미열람 상태
 - **권한(Authorization):** 사이트 소유자/운영자 본인이 점검을 요청·승인 (self-owned)
 - **원칙:** 비파괴(non-destructive)·저볼륨 요청만 사용. DoS/대량요청/브루트포스/데이터변조 미수행
-- **작성일:** 2026-10-04
+- **작성일:** 2026-10-04 (2차 심화 분석 반영)
 - **다음 단계:** 화이트박스(소스코드) 확보 후 각 항목의 실제 원인 확인 및 수정 가이드 제공
+
+> **2차 심화 분석 업데이트:** 내부 JSP include·레거시 JS·엔드포인트 라우팅을 추가로 분석하여
+> **F-16 ~ F-22**(쿠키 기반 DOM XSS, 조각 JSP 미인증 노출, 파일 업로드 표면, 공격자 제어 iframe,
+> 레거시 jQuery 혼용, 인가 게이트 동작)를 추가했습니다. 공격 표면 인벤토리도 확장되었습니다(§2-B, §3).
 
 > 이 리포트는 "외부에서 관찰 가능한 표면"에 대한 것입니다. 아래 다수 항목은 **잠재 취약점 후보**이며,
 > 실제 익스플로잇 가능 여부는 화이트박스 단계에서 코드로 확정합니다.
@@ -263,6 +267,97 @@ iframe.contentWindow.postMessage({
 
 ---
 
+## 2-B. 심화 점검 추가 발견 (2차 — 더 깊은 분석)
+
+> 1차 리포트 이후 내부 JSP include·레거시 JS·엔드포인트 라우팅을 추가 분석하여 확정한 항목입니다.
+
+### 🔴 F-16 (High, 확정) 쿠키 기반 DOM XSS — `gameImg` 쿠키 → `.html()`
+
+내부 JSP `/common/inc/contentFavorites.jsp`(아래 F-17로 **미인증 직접 접근 가능**)의 `displayImages()` 함수가 **`gameImg` 쿠키를 `JSON.parse` 후 인코딩 없이 HTML로 조립·삽입**합니다.
+
+```js
+function getImagesFromCookie() {
+    ...
+    return JSON.parse(imagesString) || [];   // gameImg 쿠키 값을 그대로 파싱
+}
+function displayImages() {
+    var images = getImagesFromCookie();
+    images.forEach(function(image, index) {
+        vHtml += '<img src="' + image.url + '" ...>';          // ← 인코딩 없음
+        vHtml += '<h6 class="...">' + image.name + '</h6>';     // ← 인코딩 없음
+    });
+    $(".game_list_slot_area").html(vHtml);   // ← DOM 삽입
+}
+```
+
+- `image.url`이 `<img src="...">` 안에, `image.name`이 `<h6>` 안에 **인코딩 없이** 삽입 → `image.url = 'x" onerror="alert(document.cookie)'` 형태로 **DOM 기반 XSS**.
+- **쿠키 쓰기 프리미티브 확보 경로:** (1) F-01/F-02의 XSS로 쿠키 설정, (2) `Secure` 플래그 부재(F-03)+HTTP 평문(F-04)이라 **MITM이 `Set-Cookie`로 `gameImg` 주입**, (3) 서브도메인 장악 시 쿠키 토싱.
+- `gameImg`에 `HttpOnly`가 없을 가능성이 높음(클라이언트 JS가 읽어야 하므로) → XSS 체인 강화.
+- **근본 해결:** `.html()` 대신 `.text()`/DOM API 사용, 또는 DOMPurify. `image.url`은 URL 허용목록 검증.
+
+### 🟠 F-17 (Medium, 확정) 내부 JSP include 파일 미인증 직접 접근
+
+`/common/inc/contentFavorites.jsp`가 **로그인 없이 `200`으로 직접 접근**되어 클라이언트 로직과 내부 엔드포인트가 노출됩니다.
+
+```
+GET /common/inc/contentFavorites.jsp  →  200 (본문 8KB, 인증 불필요)
+GET /common/inc/header.jsp 등 기타    →  404
+```
+
+- 이 파일을 통해 비공개 엔드포인트 `/wca/slotPlay`, `/wca/_gameVendorCasinoAjax`가 노출됨.
+- 본래 인증된 탭 로드 흐름에서만 포함(include)되어야 할 조각 페이지가 직접 라우팅으로 노출된 **구성 오류**. 다른 `inc` 파일은 404이므로 이 파일만 라우팅에 노출된 것으로 추정.
+- **수정:** `/common/inc/` 이하 조각 JSP는 포워드 전용으로 제한(직접 URL 접근 차단).
+
+### 🟠 F-18 (Medium/High, 화이트박스) 파일 업로드 엔드포인트 — `/slab/cmm/common/imgFileUpload`
+
+`fuc_common.js`의 `imgFileUpload()`/`imgFileUpload2()`가 `multipart/form-data`로 이미지를 업로드합니다.
+
+```js
+$("#frm1").ajaxForm({
+    url: "/slab/cmm/common/imgFileUpload",
+    enctype: "multipart/form-data",
+    dataType: "text",
+    success: function(data){ if(data=="DENY"){...} else { $("#uploadImgName").val(data); } }
+});
+```
+
+- 엔드포인트 실재 확인: `POST /slab/cmm/common/imgFileUpload` → `405`(메서드 허용 안됨, 즉 경로 존재).
+- `/slab/cmm/` 네임스페이스는 별도 레거시/백오피스 프레임워크로 추정. 업로드가 **인증을 요구하는지, 확장자/콘텐츠타입/경로/크기 검증이 있는지 화이트박스 최우선 확인**.
+- 위험: **웹쉘 업로드(.jsp/.asp)**, 경로 순회(`../`), SVG/HTML 통한 저장형 XSS, 파일명 인젝션. IIS+Tomcat 혼합 환경이라 이중확장자(`.jsp;.jpg`) 등 우회 표면 넓음.
+
+### 🟠 F-19 (Medium) 공격자 제어 iframe `src` — 미니게임 탭(tab203)
+
+`contentFavorites.jsp`의 `loadRecentGame()`은 쿠키에서 온 `game.gameUrl`을 **검증 없이 iframe `src`로 지정**합니다.
+
+```js
+$('#tab203 iframe').attr('src', game.gameUrl);   // gameUrl = 쿠키 유래
+```
+
+- `gameUrl`이 쿠키(`gameImg`) 유래이므로 F-16과 동일한 쓰기 경로로 **임의 iframe 네비게이션**(피싱/오버레이) 가능.
+- 카지노 게임은 새 창으로 `window.open(data.data.url, ...)`도 수행 → 서버가 내려주는 URL의 출처/검증(오픈 리다이렉트·SSRF)도 화이트박스 확인.
+
+### 🟡 F-20 (Low) 레거시 jQuery/플러그인 혼용 — EOL 버전
+
+프론트엔드 라이브러리 버전이 페이지별로 **불일치**합니다.
+
+- 메인 앱: jQuery **3.7.1** (현행, 양호).
+- `/common/loginMove` 및 레거시 페이지: **jQuery 1.11.3** (2015년, EOL) 직접 로드 (`/js/jquery-1.11.3.min.js`).
+- `/js/jquery.cookie.js` → **v1.1** (현행 1.4.x 대비 매우 구버전).
+- EOL jQuery는 알려진 XSS/프로토타입 이슈에 노출. 레거시 페이지가 인증 영역에서 쓰이면 위험 전이.
+
+### 🟡 F-21 (Info) Tailwind CSS v4 브라우저 런타임 컴파일 (프로덕션)
+
+- `/js/index.global.js`는 **Tailwind CSS 브라우저 빌드 v4.0.14**(런타임 CSS 컴파일러)입니다.
+- 프로덕션에서 브라우저측 CSS 컴파일은 성능 저하 + 전체 유틸리티 엔진 노출. 빌드타임 CSS로 전환 권장(기능상 취약점은 아님).
+
+### 🟢 F-22 (긍정적 관측) 주요 기능 엔드포인트에 인가 게이트 존재
+
+- `/wca/slot2`, `/wca/live2`, `/sports/`, `/wsports/`, `/game/inplay`, `/bbs/event` 등 게임/보드 엔드포인트는 **미인증 시 `302 → /common/loginMove`**로 차단됨.
+- dw-04.com의 미인증 랭킹 노출(F-11)과 달리 **기본 인가 게이트가 동작**. 다만 `/common/inc/contentFavorites.jsp`(F-17)와 `/_r_code (mode=bank)`는 예외로 노출됨.
+- **화이트박스 확인:** 인가가 라우팅 레벨인지 핸들러 레벨인지, 우회 가능한 경로(대소문자·인코딩·세미콜론 `;jsessionid`)가 있는지.
+
+---
+
 ## 3. 공격 표면 인벤토리 (화이트박스 대상 엔드포인트)
 
 HTML/JS에서 식별된 서버 엔드포인트 — 화이트박스에서 입력검증/권한/쿼리를 집중 리뷰:
@@ -284,6 +379,17 @@ HTML/JS에서 식별된 서버 엔드포인트 — 화이트박스에서 입력�
 | `/wca/_gameUserChipBalanceAjax` | POST | 카지노 칩 잔액 | 인증확인, IDOR |
 | `/dca/_gameUserChipBalanceAjax` | POST | 칩 잔액(다른 경로) | 동일 |
 | `/casino3/_gameVendorLobbyAjax` | POST | 게임 로비(v3) | SSRF, 인가 |
+| `/slab/cmm/common/imgFileUpload` | POST | **파일 업로드**(multipart) | **웹쉘/확장자·경로검증, 인증(F-18)** |
+| `/wca/slotPlay` | POST | 슬롯 게임 실행(.load) | 인증, 반영형 HTML/XSS |
+| `/wca/_gameVendorCasinoAjax` | POST | 카지노 게임 URL 발급 | SSRF, 오픈리다이렉트, 인가 |
+| `/wca/slot2?vendorKey=` | GET | 슬롯 페이지(.load, 인증) | `vendorKey` 반영/인젝션 |
+| `/wca/live2` | GET | 라이브 카지노(인증) | 인가 |
+| `/sports/` `/wsports/?type=` | GET | 스포츠북(인증) | `type` 반영, 인가 |
+| `/game/inplay` | GET | 인플레이(인증) | 인가 |
+| `/bbs/event?seq=&type=` | GET→iframe | 이벤트/공지 상세(인증) | **SQLi/IDOR(`seq`)**, 반영형 XSS |
+| `/common/inc/contentFavorites.jsp` | GET | 즐겨찾기 조각(**미인증 노출**) | **쿠키 DOM XSS(F-16), 노출(F-17)** |
+| `/common/statistical` | POST | 접속 통계 수집 | 인증, 저장형 처리 |
+| `/ia/member/logout` | POST | 레거시 로그아웃 | 세션 무효화 |
 
 > 카지노/스포츠 도메인 특성상 **금전 로직**(입출금, 포인트/롤링, 쿠폰, 베팅 정산)이 최우선 리뷰 대상입니다: 금액/수량 **서버측 재검증**, **원자적 트랜잭션**, **IDOR**(타인 계정 자금 접근), **경쟁조건(race condition)**(중복 출금/베팅), **음수/오버플로우**.
 
@@ -303,8 +409,12 @@ HTML/JS에서 식별된 서버 엔드포인트 — 화이트박스에서 입력�
 | 서버 오류→DOM 삽입 | 미관측 | **확정 (Critical)** | swt-222 고유 (pub.js) |
 | RSA 키 노출 | 미관측 | **확정** | swt-222 고유 |
 | 보안코드 비활성화 | 전체 주석 | PC만 주석 (모바일은 활성) | 부분 동일 |
-| jQuery 버전 | 1.11.3 (EOL) | 3.7.1 (현행) | swt-222이 양호 |
+| jQuery 버전 | 1.11.3 (EOL) | 메인 3.7.1 / 레거시 1.11.3 혼용 | swt-222 부분 양호 (F-20) |
 | SRI | 0개 | 0개 | 동일 문제 |
+| 쿠키 기반 DOM XSS | 미관측 | **확정 (F-16)** | swt-222 고유 (gameImg 쿠키) |
+| 내부 조각 미인증 노출 | 민감경로 403(불명) | **확정 (F-17)** | contentFavorites.jsp |
+| 파일 업로드 표면 | 미관측 | **확정 존재 (F-18)** | /slab/cmm/ imgFileUpload |
+| 미인증 데이터 노출 | 랭킹 노출(F-11) | 대부분 인가 게이트(F-22) | swt-222이 양호 |
 
 ---
 
@@ -318,9 +428,14 @@ HTML/JS에서 식별된 서버 엔드포인트 — 화이트박스에서 입력�
 6. **인증/세션:** 로그인 성공 시 세션 재생성(`session.invalidate()` + 신규 생성), 로그아웃 시 완전 무효화.
 7. **인가/IDOR:** `balanceAjax`, `_transferCasinoAjax` 등에서 사용자 식별이 세션에서 오는지 클라이언트 파라미터를 신뢰하는지. `seqKey`의 의미와 검증.
 8. **금전 로직:** `changePoint`, `_transferCasinoAjax`의 트랜잭션 원자성, 경쟁조건(동시 요청으로 이중 전환), 음수/오버플로우.
-9. **Socket.IO:** 인증 방식(토큰/세션), 이벤트 검증, 권한 분리. WebSocket hijacking 가능성.
-10. **파일 업로드:** `/upload/League/` 경로 존재 확인 — 업로드 기능이 있으면 확장자/콘텐츠타입/경로 처리.
+9. **Socket.IO:** 인증 방식(토큰/세션), 이벤트 검증, 권한 분리. WebSocket hijacking 가능성. (연결 URL은 인증 후 로드되어 블랙박스 미확인)
+10. **파일 업로드 (F-18):** `/slab/cmm/common/imgFileUpload` — 인증 요구 여부, 서버측 확장자 허용목록(블랙리스트 금지), 콘텐츠타입·매직바이트 검증, 저장 경로(웹루트 외부·실행권한 제거), 파일명 정규화(경로순회 차단), IIS/Tomcat 이중확장자·`;` 우회 대응.
 11. **무기명 회원가입:** 자동 가입 남용 방지(레이트리밋, 캡차), 지갑 주소 검증.
+12. **쿠키 DOM XSS (F-16):** `gameImg` 쿠키 생성 주체(서버/클라이언트), `HttpOnly`/`Secure` 설정, `image.url`/`image.name`/`gameUrl`의 출력 인코딩. `contentFavorites.jsp`의 `.html()` 싱크 전면 점검.
+13. **조각 JSP 노출 (F-17):** `/common/inc/*` 직접 URL 접근 차단(포워드 전용), 라우팅/시큐리티 설정에서 include 조각이 핸들러로 노출되지 않는지.
+14. **게시판 `seq` (F-16/인벤토리):** `/bbs/event?seq=`의 `seq`/`type`이 쿼리에 바인딩되는 방식(SQLi), 타 사용자 글 접근(IDOR).
+15. **게임 URL 발급:** `/wca/_gameVendorCasinoAjax`·`fn_pfPageLoad`가 반환하는 `gameUrl`의 생성·검증(오픈 리다이렉트/SSRF), `window.open` 대상 제한.
+16. **인가 우회 (F-22):** 인가 게이트가 라우팅/핸들러 어느 레벨인지, 대소문자·URL 인코딩·`;jsessionid`·경로 정규화 우회 가능성.
 
 ---
 
@@ -395,6 +510,21 @@ curl -sS -A "$UA" https://swt-222.com/js/script.js | grep -A 3 "addEventListener
 
 # pub.js의 responseText→DOM 삽입 패턴 확인
 curl -sS -A "$UA" https://swt-222.com/js/pub.js | grep "html(e.responseText)"
+
+# F-16/F-17: 내부 조각 JSP 미인증 노출 + 쿠키 DOM XSS 싱크 확인
+curl -sS -o /dev/null -w "%{http_code}\n" -A "$UA" https://swt-222.com/common/inc/contentFavorites.jsp   # 200
+curl -sS -A "$UA" https://swt-222.com/common/inc/contentFavorites.jsp | grep -E "getImagesFromCookie|game_list_slot_area"
+
+# F-18: 파일 업로드 엔드포인트 실재 확인 (405 = 경로 존재, POST 전용)
+curl -sS -o /dev/null -w "%{http_code}\n" -A "$UA" https://swt-222.com/slab/cmm/common/imgFileUpload
+
+# F-20: 레거시 EOL jQuery 로드 확인
+curl -sS -A "$UA" https://swt-222.com/common/loginMove | grep "jquery-1.11.3"
+
+# F-22: 인가 게이트 동작 확인 (미인증 시 302 → loginMove)
+for p in /wca/slot2 /wca/live2 /sports/ /game/inplay /bbs/event; do
+  curl -sS -o /dev/null -w "%{http_code} %{redirect_url}  $p\n" -A "$UA" "https://swt-222.com$p"
+done
 ```
 
 ---
