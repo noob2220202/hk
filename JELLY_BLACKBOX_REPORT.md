@@ -29,9 +29,9 @@
 
 | 심각도 | 건수 |
 |--------|------|
-| **CRITICAL** | 6 |
+| **CRITICAL** | 5 |
 | **HIGH** | 7 |
-| **MEDIUM** | 6 |
+| **MEDIUM** | 7 |
 | **LOW** | 5 |
 | **합계** | **24** |
 
@@ -137,31 +137,7 @@ SSR HTML에서 추출한 설정 (비인증 상태로 메인 페이지 접근 시
 
 ---
 
-### C-4. 세션 PATCH로 계정 강제 탈퇴 — 계정 파괴 공격
-
-**엔드포인트**: `PATCH /api/session`  
-**OPTIONS 응답**: `allow: DELETE, OPTIONS, PATCH`
-
-**재현 과정**:
-```
-1. 정상 로그인 (rnalswo1 계정)
-2. PATCH /api/session → {"userRole":"ADMIN","userType":"ADMIN"}
-3. 응답: {"ok":false,"kicked":true,"reason":"session_removed"}
-4. 재로그인 시도 → {"ok":false,"reason":"WITHDRAWN","message":"탈퇴된 계정입니다."}
-```
-
-**실제 결과**: 테스트 계정(rnalswo1)이 **영구 탈퇴 처리**됨. 로그인 불가.
-
-**위험성**:
-- 인증된 사용자가 PATCH 요청 한 번으로 자신의 계정을 영구 탈퇴시킬 수 있음
-- **CSRF 공격**과 결합 시: 악성 사이트가 로그인된 사용자를 대상으로 PATCH 요청을 유도하면 **타인의 계정을 강제 탈퇴**시킬 수 있음
-- SameSite=Lax 쿠키이므로 top-level navigation POST/PATCH는 차단되지만, `fetch()` API나 `XMLHttpRequest`로 same-site 조건에서 악용 가능
-- DELETE 메서드도 허용되어 있어 추가 공격 벡터 존재
-
-**권장조치**:
-- PATCH /api/session에서 계정 상태 변경 기능 제거
-- 탈퇴 처리는 별도의 `/api/user/withdraw` 엔드포인트에서 비밀번호 재확인 후 처리
-- CSRF 토큰 검증을 모든 상태 변경 API에 적용
+### ~~C-4~~ → M-7로 이동 (자기 계정만 해당, 남의 계정 탈퇴 불가)
 
 ---
 
@@ -507,6 +483,24 @@ SSR HTML과 API에서 노출된 업로드 경로 패턴:
 
 ---
 
+### M-7. 세션 PATCH로 비밀번호 확인 없이 계정 탈퇴
+
+**엔드포인트**: `PATCH /api/session`  
+**OPTIONS 응답**: `allow: DELETE, OPTIONS, PATCH`
+
+**재현**: `PATCH /api/session` + `{"userRole":"ADMIN"}` → 계정 영구 탈퇴
+
+**참고**: 자기 계정만 해당되므로 타인 공격에는 직접 사용 불가. CSRF(SameSite=Lax)와 결합해도 공격자에게 직접적 이득이 없음.
+
+**그럼에도 문제인 이유**:
+- 탈퇴 시 **비밀번호 재확인 없음** — 일반적인 탈퇴 플로우(비밀번호 입력 → 확인 → 탈퇴)를 우회
+- 잘못된 API 호출 한 번으로 계정 영구 소멸 — 복구 불가
+- 정상적인 탈퇴 UI 없이 숨겨진 경로로만 동작 (설계 결함)
+
+**권장조치**: PATCH /api/session에서 계정 상태 변경 분리, 탈퇴는 비밀번호 재확인 필수.
+
+---
+
 ## 6. LOW 발견사항
 
 ### L-1. SSR에 에셋 경로/배너/파비콘 전체 인라인
@@ -649,15 +643,15 @@ x-powered-by:
 **차단점**: 로그인 + 출금 비밀번호 모두 브루트포스 방어 없음  
 **현실성**: ★★★★★
 
-### 시나리오 F: CSRF 계정 파괴 공격
+### 시나리오 F: 계정 탈취 → 강제 탈퇴로 증거 인멸
 ```
-1. 악성 사이트에 PATCH /api/session 요청 삽입
-2. 피해자가 jelly2022.com 로그인 상태에서 악성 사이트 방문
-3. PATCH 요청 → 계정 강제 탈퇴
-4. 피해자는 로그인 불가, 잔액 접근 불가
+1. 브루트포스로 피해자 계정 탈취 (C-2)
+2. 잔액 전체 출금 (C-5로 PIN 크래킹)
+3. PATCH /api/session → 피해자 계정 영구 탈퇴
+4. 피해자는 계정 자체가 사라져 피해 입증 어려움
 ```
-**차단점**: SameSite=Lax로 직접 CSRF는 어려우나, same-site XSS와 결합 시 가능  
-**현실성**: ★★★☆☆
+**차단점**: 로그인 + PIN 크래킹 필요  
+**현실성**: ★★☆☆☆ (복합 공격)
 
 ---
 
@@ -672,17 +666,17 @@ x-powered-by:
 | **정보 유출** | 서버 헤더(Apache/PHP 버전) | 전체 운영 설정 SSR 노출 (더 심각) |
 | **보안 헤더** | 7개 누락 | 6개 누락 (유사) |
 | **SQL Injection** | eval() 기반 위험 | SaaS 플랫폼으로 ORM 사용 추정 (양호) |
-| **특이 사항** | 평문 비밀번호 반환 | impersonate 프로바이더 노출, PATCH 계정 파괴 |
+| **특이 사항** | 평문 비밀번호 반환 | impersonate 프로바이더 노출, 카지노 출금 무검증 |
 | **출금 보안** | 미테스트 | PIN 브루트포스 방어 없음 |
 | **카지노 API** | 미테스트 | 빈 body로 withdraw OK 반환 |
 
-**결론**: 젤리카지노가 모던 스택(Next.js/NextAuth)을 사용하여 인증 쿠키 보안, IDOR 방어(CUID), 금액 검증은 우수. 그러나 **PATCH /api/session 계정 파괴**, **출금 PIN 브루트포스 무방어**, **전체 운영 설정 SSR 노출**, **카지노 출금 API 무검증**은 실질적으로 더 위험한 취약점.
+**결론**: 젤리카지노가 모던 스택(Next.js/NextAuth)을 사용하여 인증 쿠키 보안, IDOR 방어(CUID), 금액 검증은 우수. 그러나 **출금 PIN 브루트포스 무방어**, **전체 운영 설정 SSR 노출**, **카지노 출금 API 무검증**, **impersonate 프로바이더 노출**은 실질적으로 위험한 취약점.
 
 ---
 
 ## 10. 화이트박스 테스트 시 우선 확인 사항
 
-1. **PATCH /api/session 계정 파괴 로직** — 왜 PATCH가 계정 탈퇴를 트리거하는지, CSRF 방어 존재 여부 ★★★★★
+1. **PATCH /api/session 계정 탈퇴 로직** — 왜 PATCH가 계정 탈퇴를 트리거하는지, 의도된 설계인지 ★★★☆☆
 2. **impersonate 프로바이더 구현** — 서버 측 검증 로직 (userId 검증, 관리자 세션 필수 여부) ★★★★★
 3. **rate limiting 미들웨어** — 로그인 + 출금 비밀번호 모두 왜 적용 안 되는지 ★★★★★
 4. **/api/casino/*/withdraw 검증 로직** — 빈 body로 ok:true 반환하는 이유 ★★★★☆
